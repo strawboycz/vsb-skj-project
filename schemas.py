@@ -1,11 +1,10 @@
 from pydantic import BaseModel
 from datetime import datetime
-
+from typing import List
 
 # -------------------------
-# 📤 RESPONSE: Upload
+# Upload response
 # -------------------------
-
 class FileUploadResponse(BaseModel):
     id: str
     filename: str
@@ -13,20 +12,8 @@ class FileUploadResponse(BaseModel):
 
 
 # -------------------------
-# 📄 RESPONSE: File detail
+# File detail (pro seznam)
 # -------------------------
-
-class FileResponseModel(BaseModel):
-    id: str
-    filename: str
-    size: int
-    created_at: datetime
-
-
-# -------------------------
-# 📄 RESPONSE: List files
-# -------------------------
-
 class FileListItem(BaseModel):
     id: str
     filename: str
@@ -34,12 +21,24 @@ class FileListItem(BaseModel):
 
 
 class FileListResponse(BaseModel):
-    files: list[FileListItem]
+    files: List[FileListItem]
 
 
 # -------------------------
-# 🗑️ RESPONSE: Delete
+# Delete response
 # -------------------------
-
 class DeleteResponse(BaseModel):
     detail: str
+
+
+# -------------------------
+# ORM mode (volitelný, pokud chceme přímo vracet SQLAlchemy objekty)
+# -------------------------
+class FileResponseModel(BaseModel):
+    id: str
+    filename: str
+    size: int
+    created_at: datetime
+
+    class Config:
+        orm_mode = True

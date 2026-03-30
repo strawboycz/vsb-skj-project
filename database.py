@@ -1,56 +1,44 @@
+# database.py
+import os
 from sqlalchemy import create_engine, Column, String, Integer, DateTime
-from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from datetime import datetime
-from typing import Generator
 
 # -------------------------
-# ⚙️ KONFIGURACE DB
+# Konfigurace DB (SQLite)
 # -------------------------
-
-DATABASE_URL = "sqlite:///./files.db"
-
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False}  # nutné pro SQLite
-)
-
-SessionLocal = sessionmaker(
-    autocommit=False,
-    autoflush=False,
-    bind=engine
-)
+DB_FILE = "storage.db"
+engine = create_engine(f"sqlite:///{DB_FILE}", echo=False, future=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
 
 
 # -------------------------
-# 🧱 MODEL
+# SQLAlchemy model souboru
 # -------------------------
-
 class File(Base):
     __tablename__ = "files"
 
     id = Column(String, primary_key=True, index=True)
-    user_id = Column(String, index=True, nullable=False)
-    filename = Column(String, nullable=False)
-    path = Column(String, nullable=False)
-    size = Column(Integer, nullable=False)
+    user_id = Column(String, index=True)
+    filename = Column(String)
+    path = Column(String)
+    size = Column(Integer)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
 # -------------------------
-# 🏗️ INIT DB
+# Inicializace DB
 # -------------------------
-
 def init_db():
     Base.metadata.create_all(bind=engine)
 
 
 # -------------------------
-# 🔌 DEPENDENCY (FastAPI)
+# Session dependency
 # -------------------------
-
-def get_db() -> Generator[Session, None, None]:
+def get_db():
     db = SessionLocal()
     try:
         yield db
@@ -59,28 +47,26 @@ def get_db() -> Generator[Session, None, None]:
 
 
 # -------------------------
-# 📦 CRUD OPERACE
+# CRUD helper funkce
 # -------------------------
-
-def create_file(db: Session, file_data: dict) -> File:
-    file = File(**file_data)
-    db.add(file)
+def create_file(db: Session, file_data: dict):
+    file_obj = File(**file_data)
+    db.add(file_obj)
     db.commit()
-    db.refresh(file)
-    return file
+    db.refresh(file_obj)
+    return file_obj
 
 
-def get_file(db: Session, file_id: str) -> File | None:
+def get_file(db: Session, file_id: str):
     return db.query(File).filter(File.id == file_id).first()
 
 
-def delete_file(db: Session, file_id: str) -> File | None:
-    file = get_file(db, file_id)
-    if file:
-        db.delete(file)
-        db.commit()
-    return file
-
-
-def get_user_files(db: Session, user_id: str) -> list[File]:
+def get_user_files(db: Session, user_id: str):
     return db.query(File).filter(File.user_id == user_id).all()
+
+
+def delete_file(db: Session, file_id: str):
+    file_obj = get_file(db, file_id)
+    if file_obj:
+        db.delete(file_obj)
+        db.commit()
