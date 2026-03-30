@@ -1,121 +1,131 @@
 import os
-import json
 import uuid
 from datetime import datetime
-# Přidali jsme import Header
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header
-import aiofiles
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Depends
 from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
+import aiofiles
 
-app = FastAPI(title="Mini Cloud Storage")
+from schemas import (
+    FileUploadResponse,
+    FileListResponse,
+    FileListItem,
+    DeleteResponse
+)
 
-# Konfigurace úložiště (MOCK_USER_ID je pryč)
+
+
+from database import (
+    get_db,
+    init_db,
+    create_file,
+    get_file,
+    delete_file,
+    get_user_files
+)
+
+# -------------------------
+# ⚙️ APP + LIFESPAN
+# -------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+app = FastAPI(
+    title="Mini Cloud Storage",
+    lifespan=lifespan
+)
+
 STORAGE_DIR = "storage"
-METADATA_FILE = "metadata.json"
 
-def load_metadata():
-    if not os.path.exists(METADATA_FILE):
-        return {}
-    with open(METADATA_FILE, "r") as f:
-        return json.load(f)
 
-def save_metadata(data):
-    with open(METADATA_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+# -------------------------
+# 📤 UPLOAD
+# -------------------------
 
-# 1. Upload souboru s dynamickým uživatelem
-@app.post("/files/upload")
-async def upload_file(file: UploadFile = File(...), x_user_id: str = Header(...)):
+@app.post("/files/upload", response_model=FileUploadResponse)
+async def upload_file(
+    file: UploadFile = File(...),
+    x_user_id: str = Header(...),
+    db: Session = Depends(get_db)
+):
     file_id = str(uuid.uuid4())
-    
-    # Složka se teď jmenuje podle toho, co přijde v hlavičce
+
     user_dir = os.path.join(STORAGE_DIR, x_user_id)
     os.makedirs(user_dir, exist_ok=True)
-    
+
     file_path = os.path.join(user_dir, file_id)
-    
-    file_size = 0
-    async with aiofiles.open(file_path, 'wb') as out_file:
+
+    async with aiofiles.open(file_path, "wb") as out_file:
         content = await file.read()
         await out_file.write(content)
-        file_size = len(content)
-        
-    metadata = load_metadata()
-    file_info = {
+
+    create_file(db, {
         "id": file_id,
-        "user_id": x_user_id, # Uložíme si reálného uživatele do metadat
+        "user_id": x_user_id,
         "filename": file.filename,
         "path": file_path,
-        "size": file_size,
-        "created_at": datetime.utcnow().isoformat()
-    }
-    
-    metadata[file_id] = file_info
-    save_metadata(metadata)
-    
-    return {
-        "id": file_id,
-        "filename": file.filename,
-        "size": file_size
-    }
+        "size": len(content),
+        "created_at": datetime.utcnow()
+    })
 
-# 2. Stažení souboru (ověřuje uživatele)
-@app.get("/files/{id}")
-async def download_file(id: str, x_user_id: str = Header(...)):
-    metadata = load_metadata()
-    
-    if id not in metadata:
-        raise HTTPException(status_code=404, detail="Soubor nenalezen v metadatech")
-    
-    file_info = metadata[id]
-    
-    # Zkontrolujeme, jestli ID z hlavičky sedí s ID vlastníka v metadatech
-    if file_info["user_id"] != x_user_id:
-        raise HTTPException(status_code=403, detail="Nemáte přístup k tomuto souboru")
-        
-    file_path = file_info["path"]
-    
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Fyzický soubor nenalezen na disku")
-        
-    return FileResponse(path=file_path, filename=file_info["filename"])
+    return FileUploadResponse(
+        id=file_id,
+        filename=file.filename,
+        size=len(content)
+    )
 
-# 3. Smazání souboru
-@app.delete("/files/{id}")
-async def delete_file(id: str, x_user_id: str = Header(...)):
-    metadata = load_metadata()
-    
-    if id not in metadata:
+
+# -------------------------
+# 📥 DOWNLOAD
+# -------------------------
+
+@app.get("/files", response_model=FileListResponse)
+async def list_files(
+    x_user_id: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    files = get_user_files(db, x_user_id)
+
+    return FileListResponse(
+        files=[
+            FileListItem(
+                id=f.id,
+                filename=f.filename,
+                size=f.size
+            )
+            for f in files
+        ]
+    )
+
+
+# -------------------------
+# 🗑️ DELETE
+# -------------------------
+
+@app.delete("/files/{id}", response_model=DeleteResponse)
+async def delete_file_endpoint(
+    id: str,
+    x_user_id: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    file_info = get_file(db, id)
+
+    if not file_info:
         raise HTTPException(status_code=404, detail="Soubor nenalezen")
-        
-    file_info = metadata[id]
-    
-    # Opět kontrola přístupu
-    if file_info["user_id"] != x_user_id:
-        raise HTTPException(status_code=403, detail="Nemáte přístup k tomuto souboru")
-        
-    file_path = file_info["path"]
-    
-    if os.path.exists(file_path):
-        os.remove(file_path)
-        
-    del metadata[id]
-    save_metadata(metadata)
-    
-    return {"detail": f"Soubor {file_info['filename']} byl úspěšně smazán"}
 
-# 4. Výpis všech souborů (jen pro daného uživatele)
-@app.get("/files")
-async def list_files(x_user_id: str = Header(...)):
-    metadata = load_metadata()
-    
-    user_files = []
-    for file_id, file_info in metadata.items():
-        if file_info["user_id"] == x_user_id:
-            user_files.append({
-                "id": file_info["id"],
-                "filename": file_info["filename"],
-                "size": file_info["size"]
-            })
-            
-    return {"files": user_files}
+    if file_info.user_id != x_user_id:
+        raise HTTPException(status_code=403, detail="Nemáte přístup")
+
+    if os.path.exists(file_info.path):
+        os.remove(file_info.path)
+
+    delete_file(db, id)
+
+    return DeleteResponse(
+        detail=f"Soubor {file_info.filename} byl smazán"
+    )
