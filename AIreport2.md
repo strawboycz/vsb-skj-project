@@ -4,11 +4,11 @@
 - **ChatGPT (GPT-5-mini)** – generování Python/FastAPI kódu, Pydantic modelů, SQLAlchemy integrace, debugging.
 
 ## 2. Příklady promptů
-- „změnit ukládání dat z JSON na SQLAlchemy“
+- „[main.py] ukolem je zmenit stavajici ukladani dat do JSON souboru na ukladani do databaze pomoci sqlalchemy, vytvor soubor ktery bude toto resit“
 - „create_file(db, file_data) db není definována“
-- „finalni main.py s FastAPI“
-- „http://127.0.0.1:8000/docs neexistuje“
-- „implementovat validaci dat pomocí Pydantic“
+- „@app.on_event je depricated“
+- „http://127.0.0.1:8000/docs nenacita“
+- „Pro všechny vstupy a výstupy, tedy parametry endpointů a návratové hodnoty z nich, budeme pužívat Pydantic modely. Nadefinuj si jednotlivé modely pro requesty i response a ne jen obyčejné "raw" slovníky (dict) jako návratové hodnoty.“
 
 ## 3. Co AI vygenerovala správně
 - SQLAlchemy modely a `database.py`
