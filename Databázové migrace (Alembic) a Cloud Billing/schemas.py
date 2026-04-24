@@ -37,8 +37,11 @@ class BillingResponse(BaseModel):
     bucket_id: int
     bucket_name: str
     current_storage_bytes: int
+    # prichozi byty, byvaji zdarma
     ingress_bytes: int
+    # odchozi byty, drahe
     egress_bytes: int
+    # prenos v cloudu mezi S3, EC2
     internal_transfer_bytes: int
 
     model_config = ConfigDict(from_attributes=True)

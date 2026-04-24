@@ -1,9 +1,13 @@
 import os
 import uuid
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Depends, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Depends, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse as FastAPIFileResponse
+from fastapi.concurrency import run_in_threadpool
+import json
+import msgpack
 import aiofiles
+import ConnectionManager
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -14,6 +18,9 @@ import schemas
 
 app = FastAPI(title="Mini Cloud Storage")
 STORAGE_DIR = "storage"
+
+# globalni instance ConnectionManagera
+manager = ConnectionManager.ConnectionManager()
 
 # ==========================================
 # ENDPOINTY PRO BUCKETY
@@ -192,8 +199,18 @@ async def delete_file(id: str, x_user_id: str = Header(...), db: Session = Depen
         
     # Místo db.delete(db_file) použijeme SOFT DELETE
     db_file.is_deleted = True
+
+    # je soubor soucasti bucketu?
+    if db_file.bucket_id:
+        # najde radek kde je id stejne jako bucket id souboru
+        stmt_bucket = select(models.Bucket).where(models.Bucket.id == db_file.bucket_id)
+        bucket = db.execute(stmt_bucket).scalar_one_or_none()
+        # pokud existuje (scalar_one_or_none() nevyhodi none)
+        if bucket:
+            # odecte velikost souboru, ktery se maze od hodnoty v current_storage_bytes odstavci
+            bucket.current_storage_bytes -= db_file.size
     
-    # Pozor: Při soft delete se 'current_storage_bytes' NESNÍŽÍ, protože data na serveru stále fyzicky leží.
+    # ted uz se current_storage_bytes snizi
     db.commit()
     
     return {"detail": f"Soubor {db_file.filename} byl přesunut do koše (Soft Delete)"}
@@ -210,3 +227,100 @@ async def list_files(x_user_id: str = Header(...), db: Session = Depends(get_db)
     user_files = db.execute(stmt).scalars().all()
     
     return {"files": user_files}
+
+
+
+# ukol 5 -> pomocne funkce pro databazi
+def save_msg_to_db(db: Session, message: models.QueuedMessage):
+    db.add(message)
+    db.commit()
+
+def mark_msg_delivered_in_db(db: Session, message_id: str):
+    stmt = select(models.QueuedMessage).where(models.QueuedMessage.id == message_id)
+    msg = db.execute(stmt).scalar_one_or_none()
+    if msg:
+        msg.is_delivered = True
+        db.commit()
+
+def get_undelivered_from_db(db: Session, topic: str):
+    stmt = select(models.QueuedMessage).where(
+        models.QueuedMessage.topic == topic,
+        models.QueuedMessage.is_delivered == False
+    )
+    return db.execute(stmt).scalars().all()
+
+
+@app.websocket("/broker/{topic}")
+# ukol 5 -> pridani pristupu k databazi
+async def broker_endpoint(websocket: WebSocket, topic: str, db: Session = Depends(get_db)):
+    # ocekavani navazani spojeni
+    # kdyz se klient prihlasi k /broker/my_topic/, prida se jejich websocket do mnoziny toho topicu
+    await manager.connect(websocket, topic)
+
+    # ukol 5 -> odeslani neodeslanych zprav
+    undelivered = await run_in_threadpool(get_undelivered_from_db, db, topic)
+    for msg in undelivered:
+        try:
+            # json rozbaleni
+            payload = json.loads(msg.payload)
+            out_msg = json.dumps({"action": "deliver", "message_id": msg.id, "topic": topic, "payload": payload}).encode('utf-8')
+        except:
+            # popribade msgpack
+            payload = msgpack.unpackb(msg.payload)
+            out_msg = msgpack.packb({"action": "deliver", "message_id": msg.id, "topic": topic, "payload": payload})
+            
+        await websocket.send_bytes(out_msg)
+
+    try:
+        # event loop - otevrene pripojeni a naslouchani zpravam
+        while True:
+            # cekani na klienta nez publishne zpravu
+            data = await websocket.receive_bytes()
+
+            # kontrola formatu
+            try:
+                msg_dict = json.loads(data)
+                is_json = True
+            except:
+                msg_dict = msgpack.unpackb(data)
+                is_json = False
+
+            action = msg_dict.get("action")
+
+            # ukol 5 -> ulozeni zpravy do databaze, nez se broadcastne
+            if action == "publish":
+                new_message = models.QueuedMessage(
+                    id = str(uuid.uuid4()),
+                    topic=topic,
+                    payload=data
+                    # created_at a is_delivered maji default
+                )
+                # pri zakomentovani odebereme garantovane doruceni, snizime zatez na databazi
+                # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+                await run_in_threadpool(save_msg_to_db, db, new_message)
+
+                # zprava s id pro subscribera
+                msg_dict["action"] = "deliver"
+                msg_dict["message_id"] = new_message.id
+                
+                # pripadne zakodovani
+                if is_json:
+                    deliver_bytes = json.dumps(msg_dict).encode("utf-8")
+                else:
+                    deliver_bytes = msgpack.packb(msg_dict)
+
+                # broadcastne zpravu vsem v topicu
+                await manager.broadcast(data, topic)
+
+            elif action == "ack":
+                msg_id = msg_dict.get("message_id")
+                if msg_id:
+                    # aktualizace databaze
+                    # pri zakomentovani odebereme garantovane doruceni, snizime zatez na databazi
+                    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+                    await run_in_threadpool(mark_msg_delivered_in_db, db, msg_id)
+                    
+    # odstrani klienta pri zruseni spojeni
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, topic)
+

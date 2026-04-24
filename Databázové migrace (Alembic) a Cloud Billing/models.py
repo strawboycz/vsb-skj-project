@@ -1,5 +1,4 @@
-from sqlalchemy import String, Integer, ForeignKey
-# Všimni si, že přidávám import datetime
+from sqlalchemy import String, Integer, ForeignKey, LargeBinary, DateTime
 from datetime import datetime
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -42,3 +41,17 @@ class FileMetadata(Base):
     
     owner: Mapped["User"] = relationship(back_populates='files')
     bucket: Mapped["Bucket"] = relationship(back_populates='objects')
+
+"""
+Garantované doručení a perzistence (Durable Queues)
+"""
+
+class QueuedMessage(Base):
+    __tablename__ = 'queued_messages'
+
+    id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    topic: Mapped[str] = mapped_column(String(50))
+    # LargeBinary, pri zapisu se string zakoduje
+    payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    is_delivered: Mapped[bool] = mapped_column(Boolean, default=False)
