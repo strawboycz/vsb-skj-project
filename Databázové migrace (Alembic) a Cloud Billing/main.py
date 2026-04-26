@@ -231,53 +231,73 @@ async def list_files(x_user_id: str = Header(...), db: Session = Depends(get_db)
 
 
 # ukol 5 -> pomocne funkce pro databazi
-def save_msg_to_db(db: Session, message: models.QueuedMessage):
-    db.add(message)
-    db.commit()
+from sqlalchemy.orm import Session
+from database import engine
 
-def mark_msg_delivered_in_db(db: Session, message_id: str):
-    stmt = select(models.QueuedMessage).where(models.QueuedMessage.id == message_id)
-    msg = db.execute(stmt).scalar_one_or_none()
-    if msg:
-        msg.is_delivered = True
+def save_msg_to_db(message: models.QueuedMessage):
+    with Session(engine) as db:
+        db.add(message)
         db.commit()
 
-def get_undelivered_from_db(db: Session, topic: str):
-    stmt = select(models.QueuedMessage).where(
-        models.QueuedMessage.topic == topic,
-        models.QueuedMessage.is_delivered == False
-    )
-    return db.execute(stmt).scalars().all()
+def mark_msg_delivered_in_db(message_id: str):
+    with Session(engine) as db:
+        stmt = select(models.QueuedMessage).where(models.QueuedMessage.id == message_id)
+        msg = db.execute(stmt).scalar_one_or_none()
+        if msg:
+            msg.is_delivered = True
+            db.commit()
+
+def get_undelivered_from_db(topic: str):
+    with Session(engine) as db:
+        stmt = select(models.QueuedMessage).where(
+            models.QueuedMessage.topic == topic,
+            models.QueuedMessage.is_delivered == False
+        )
+        msgs = db.execute(stmt).scalars().all()
+        # Magie: Odpojíme zprávy od DB, aby nezařvaly chybu po zavření bloku 'with'
+        db.expunge_all() 
+        return msgs
 
 
 @app.websocket("/broker/{topic}")
-# ukol 5 -> pridani pristupu k databazi
-async def broker_endpoint(websocket: WebSocket, topic: str, db: Session = Depends(get_db)):
-    # ocekavani navazani spojeni
-    # kdyz se klient prihlasi k /broker/my_topic/, prida se jejich websocket do mnoziny toho topicu
+async def broker_endpoint(websocket: WebSocket, topic: str):  # <-- TADY SMAZÁNO 'db: Session = Depends(get_db)'
     await manager.connect(websocket, topic)
 
-    # ukol 5 -> odeslani neodeslanych zprav
-    undelivered = await run_in_threadpool(get_undelivered_from_db, db, topic)
+    undelivered = await run_in_threadpool(get_undelivered_from_db, topic)
     for msg in undelivered:
         try:
-            # json rozbaleni
-            payload = json.loads(msg.payload)
-            out_msg = json.dumps({"action": "deliver", "message_id": msg.id, "topic": topic, "payload": payload}).encode('utf-8')
-        except:
-            # popribade msgpack
-            payload = msgpack.unpackb(msg.payload)
-            out_msg = msgpack.packb({"action": "deliver", "message_id": msg.id, "topic": topic, "payload": payload})
+            # Zkusíme jako JSON
+            original_dict = json.loads(msg.payload)
+            inner_payload = original_dict.get("payload") # Vytáhneme pouze čistá data
+            
+            # Vytvoříme striktní objekt pomocí Pydantic modelu
+            deliver_msg = schemas.WSDeliverMessage(
+                action="deliver",
+                topic=topic,
+                message_id=msg.id,
+                payload=inner_payload
+            )
+            out_msg = deliver_msg.model_dump_json().encode('utf-8')
+            
+        except Exception:
+            # Pokud to selže, jde o MessagePack
+            original_dict = msgpack.unpackb(msg.payload)
+            inner_payload = original_dict.get("payload")
+            
+            deliver_msg = schemas.WSDeliverMessage(
+                action="deliver",
+                topic=topic,
+                message_id=msg.id,
+                payload=inner_payload
+            )
+            out_msg = msgpack.packb(deliver_msg.model_dump())
             
         await websocket.send_bytes(out_msg)
 
     try:
-        # event loop - otevrene pripojeni a naslouchani zpravam
         while True:
-            # cekani na klienta nez publishne zpravu
             data = await websocket.receive_bytes()
 
-            # kontrola formatu
             try:
                 msg_dict = json.loads(data)
                 is_json = True
@@ -285,42 +305,55 @@ async def broker_endpoint(websocket: WebSocket, topic: str, db: Session = Depend
                 msg_dict = msgpack.unpackb(data)
                 is_json = False
 
+            # --- VALIDACE PYDANTIC MODELEM (ÚKOL 5) ---
             action = msg_dict.get("action")
-
-            # ukol 5 -> ulozeni zpravy do databaze, nez se broadcastne
-            if action == "publish":
-                new_message = models.QueuedMessage(
-                    id = str(uuid.uuid4()),
-                    topic=topic,
-                    payload=data
-                    # created_at a is_delivered maji default
-                )
-                # pri zakomentovani odebereme garantovane doruceni, snizime zatez na databazi
-                # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-                await run_in_threadpool(save_msg_to_db, db, new_message)
-
-                # zprava s id pro subscribera
-                msg_dict["action"] = "deliver"
-                msg_dict["message_id"] = new_message.id
-                
-                # pripadne zakodovani
-                if is_json:
-                    deliver_bytes = json.dumps(msg_dict).encode("utf-8")
+            
+            try:
+                if action == "publish":
+                    # Validujeme, že publish zpráva má správný formát
+                    valid_msg = schemas.WSPublishMessage(**msg_dict)
+                elif action == "ack":
+                    # Validujeme, že ack zpráva obsahuje message_id
+                    valid_msg = schemas.WSAckMessage(**msg_dict)
                 else:
-                    deliver_bytes = msgpack.packb(msg_dict)
+                    continue # Neznámá akce, ignorujeme
+            except Exception as e:
+                # Pokud zpráva neodpovídá Pydantic modelu, zahodíme ji
+                continue
 
-                # broadcastne zpravu vsem v topicu
-                await manager.broadcast(data, topic)
+            if action == "publish":
+                msg_id = str(uuid.uuid4())
+                
+                new_message = models.QueuedMessage(
+                    id=msg_id, 
+                    topic=topic,
+                    payload=data # do DB ukládáme raw byty
+                )
+                
+                await run_in_threadpool(save_msg_to_db, new_message)
+
+                # SPRAVNÉ POUŽITÍ PYDANTICU: Vytvoříme bezpečný objekt pro odeslání
+                deliver_msg = schemas.WSDeliverMessage(
+                    action="deliver",
+                    topic=topic,
+                    message_id=msg_id,
+                    payload=valid_msg.payload # Použijeme payload ze zvalidovaného objektu!
+                )
+                
+                # Serializace čistého Pydantic objektu
+                if is_json:
+                    deliver_bytes = deliver_msg.model_dump_json().encode("utf-8")
+                else:
+                    deliver_bytes = msgpack.packb(deliver_msg.model_dump())
+
+                await manager.broadcast(deliver_bytes, topic)
 
             elif action == "ack":
                 msg_id = msg_dict.get("message_id")
                 if msg_id:
-                    # aktualizace databaze
-                    # pri zakomentovani odebereme garantovane doruceni, snizime zatez na databazi
-                    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-                    await run_in_threadpool(mark_msg_delivered_in_db, db, msg_id)
+                    await run_in_threadpool(mark_msg_delivered_in_db, msg_id)
                     
-    # odstrani klienta pri zruseni spojeni
-    except WebSocketDisconnect:
+    except Exception:
+        pass
+    finally:
         manager.disconnect(websocket, topic)
-

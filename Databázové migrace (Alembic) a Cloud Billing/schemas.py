@@ -45,3 +45,21 @@ class BillingResponse(BaseModel):
     internal_transfer_bytes: int
 
     model_config = ConfigDict(from_attributes=True)
+
+from typing import Any, Optional
+
+# --- NOVÉ MODELY PRO WEBSOCKET PROTOKOL (ÚKOL 5) ---
+class WSMessageBase(BaseModel):
+    action: str
+
+class WSPublishMessage(WSMessageBase):
+    payload: Any
+
+class WSAckMessage(WSMessageBase):
+    message_id: str
+
+# Model pro zprávu, kterou Broker posílá Subscriberům
+class WSDeliverMessage(WSMessageBase):
+    topic: str
+    message_id: str
+    payload: Any
