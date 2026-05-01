@@ -16,7 +16,18 @@ from database import engine, get_db
 import models
 import schemas
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI(title="Mini Cloud Storage")
+
+# --- POVOLENÍ CORS PRO REACT ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # V produkci by zde byla jen URL React aplikace
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 STORAGE_DIR = "storage"
 
 # globalni instance ConnectionManagera
@@ -357,3 +368,61 @@ async def broker_endpoint(websocket: WebSocket, topic: str):  # <-- TADY SMAZÁN
         pass
     finally:
         manager.disconnect(websocket, topic)
+
+# ==========================================
+# ENDPOINT PRO ZPRACOVÁNÍ OBRAZU (S3 Gateway -> Broker)
+# ==========================================
+@app.post("/buckets/{bucket_id}/objects/{object_id}/process")
+async def process_image(
+    bucket_id: int, 
+    object_id: str, 
+    request: schemas.ProcessImageRequest,
+    x_user_id: str = Header(...), # Přidáno pro autentizaci a cestu
+    db: Session = Depends(get_db)
+):
+    # 1. Ověříme, že obrázek existuje a patří uživateli
+    stmt = select(models.FileMetadata).where(
+        models.FileMetadata.id == object_id,
+        models.FileMetadata.bucket_id == bucket_id,
+        models.FileMetadata.user_id == x_user_id,
+        models.FileMetadata.is_deleted == False
+    )
+    db_file = db.execute(stmt).scalar_one_or_none()
+    
+    if not db_file:
+        raise HTTPException(status_code=404, detail="Obrázek nenalezen nebo k němu nemáte přístup")
+
+    # 2. Vytvoříme payload pro Workera (PŘIDÁNO user_id)
+    job_payload = {
+        "operation": request.operation,
+        "image_id": object_id, 
+        "user_id": x_user_id,
+        "bucket_id": bucket_id,
+        "params": request.params
+    }
+
+    # 3. Uložíme zprávu do Durable Queues
+    msg_id = str(uuid.uuid4())
+    topic = "image.jobs"
+    
+    raw_publish_data = json.dumps({"action": "publish", "payload": job_payload}).encode("utf-8")
+    
+    new_message = models.QueuedMessage(
+        id=msg_id,
+        topic=topic,
+        payload=raw_publish_data
+    )
+    await run_in_threadpool(save_msg_to_db, new_message)
+
+    # 4. Odešleme zprávu Workerům
+    deliver_msg = schemas.WSDeliverMessage(
+        action="deliver",
+        topic=topic,
+        message_id=msg_id,
+        payload=job_payload
+    )
+    deliver_bytes = deliver_msg.model_dump_json().encode("utf-8")
+    
+    await manager.broadcast(deliver_bytes, topic)
+
+    return {"status": "processing_started"}

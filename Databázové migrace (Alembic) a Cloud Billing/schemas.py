@@ -63,3 +63,8 @@ class WSDeliverMessage(WSMessageBase):
     topic: str
     message_id: str
     payload: Any
+
+# --- MODELY PRO ZPRACOVÁNÍ OBRAZU (ÚKOL: Image Worker) ---
+class ProcessImageRequest(BaseModel):
+    operation: str
+    params: Optional[dict] = None
