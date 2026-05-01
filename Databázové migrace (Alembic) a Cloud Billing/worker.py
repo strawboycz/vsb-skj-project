@@ -31,19 +31,27 @@ def process_image_sync(input_path: str, output_path: str, job_data: dict):
         new_array = img_array[:, ::-1, :]
         
     elif op == "crop":
-        # 3. Ořez (Slicing + Validace)
+        # Parametry nyní chápeme jako OKRAJE (kolik uříznout z každé strany)
         params = job_data.get("params", {})
-        top = params.get("top", 0)
-        bottom = params.get("bottom", img_array.shape[0])
-        left = params.get("left", 0)
-        right = params.get("right", img_array.shape[1])
-        
-        # Validace rozměrů (chyták ze zadání)
         h, w, _ = img_array.shape
-        if top < 0 or bottom > h or left < 0 or right > w or top >= bottom or left >= right:
-            raise ValueError(f"Neplatné parametry ořezu pro obrázek o velikosti {w}x{h}.")
+        
+        # Kolik pixelů uříznout z dané strany (výchozí 0)
+        m_top = params.get("top", 0)
+        m_bottom = params.get("bottom", 0)
+        m_left = params.get("left", 0)
+        m_right = params.get("right", 0)
+        
+        # Výpočet cílových souřadnic (slicing)
+        y_start = m_top
+        y_end = h - m_bottom
+        x_start = m_left
+        x_end = w - m_right
+        
+        # Validace: Nesmíme uříznout víc, než obrázek má
+        if y_start >= y_end or x_start >= x_end:
+            raise ValueError(f"Neplatný ořez. Obrázek {w}x{h} nelze oříznout o {m_left}+{m_right} šířky a {m_top}+{m_bottom} výšky.")
             
-        new_array = img_array[top:bottom, left:right, :]
+        new_array = img_array[y_start:y_end, x_start:x_end, :]
         
     elif op == "brightness":
         # 4. Zesvětlení (Přetypování a Saturace)
@@ -196,7 +204,7 @@ async def worker_loop():
                         await websocket.send(json.dumps(ack_msg).encode("utf-8"))
                         print(f"[<] Odesláno ACK pro message_id: {message_id}")
 
-                        
+
         except websockets.exceptions.ConnectionClosed:
             print("[!] Spojení s brokerem ztraceno. Zkouším se znovu připojit za 3s...")
             await asyncio.sleep(3)

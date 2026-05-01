@@ -1,0 +1,11 @@
+Spusť Backend: V prvním terminálu zadej:
+uvicorn main:app --reload
+
+Spusť Workera: Ve druhém terminálu zadej:
+python worker.py
+
+Spusť Web: Ve třetím terminálu (tam, kde máš index.html) zadej:
+python -m http.server 3000
+
+Otevři prohlížeč: Běž na adresu:
+http://localhost:3000/index.html

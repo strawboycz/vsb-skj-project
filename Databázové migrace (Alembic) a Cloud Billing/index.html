@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cloud Image Processor v3</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; color: #333; line-height: 1.6; }
+        .panel { background: #f8f9fa; padding: 25px; border-radius: 12px; border: 1px solid #dee2e6; margin-bottom: 25px; box-shadow: 0 4px 10px rgba(0,0,0,0.08); }
+        h1 { color: #007bff; text-align: center; margin-bottom: 30px; }
+        
+        .field-group { margin-bottom: 20px; }
+        .label { font-weight: bold; margin-bottom: 8px; display: block; color: #495057; }
+        
+        select, button, input[type="file"], input[type="number"] { 
+            padding: 10px; font-size: 15px; border-radius: 6px; border: 1px solid #ced4da; 
+        }
+        
+        input[type="number"] { width: 100px; margin-right: 10px; }
+        
+        button { background: #007bff; color: white; border: none; cursor: pointer; transition: all 0.2s; font-weight: bold; padding: 12px 24px; }
+        button:hover { background: #0056b3; transform: translateY(-1px); }
+        button:disabled { background: #6c757d; cursor: not-allowed; }
+
+        .param-box { 
+            background: #ffffff; padding: 15px; border-radius: 8px; border: 1px dashed #007bff; 
+            margin-top: 15px; display: none; 
+        }
+
+        .status { margin-top: 20px; padding: 12px; border-radius: 6px; background: #e9ecef; font-family: 'Courier New', Courier, monospace; font-size: 14px; border-left: 4px solid #007bff; }
+        
+        .images { display: flex; gap: 25px; margin-top: 30px; }
+        .images div { flex: 1; text-align: center; }
+        img { width: 100%; border-radius: 8px; display: none; box-shadow: 0 4px 8px rgba(0,0,0,0.15); }
+        #processedImg { border: 4px solid #28a745; }
+        
+        .grid-params { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; max-width: 400px; }
+        .grid-params div { display: flex; flex-direction: column; align-items: flex-start; }
+        .grid-params label { font-size: 13px; margin-bottom: 4px; color: #666; }
+    </style>
+</head>
+<body>
+
+    <h1>☁️ Cloud Image Processor</h1>
+    
+    <div class="panel">
+        <div class="field-group">
+            <span class="label">1. Nahrát obrázek:</span>
+            <input type="file" id="fileInput" accept="image/jpeg, image/png">
+        </div>
+        
+        <div class="field-group">
+            <span class="label">2. Vybrat operaci:</span>
+            <select id="operation">
+                <option value="negative">Inverze barev (Negativ)</option>
+                <option value="flip">Horizontální zrcadlo</option>
+                <option value="grayscale">Černobílý filtr</option>
+                <option value="brightness">Úprava jasu (Brightness)</option>
+                <option value="crop">Ořezání okrajů (Crop)</option>
+            </select>
+        </div>
+
+        <!-- Dynamické parametry pro Brightness -->
+        <div id="brightnessParams" class="param-box">
+            <span class="label">Intenzita změny:</span>
+            <input type="number" id="brightVal" value="50"> 
+            <small>(+ světlejší, - tmavší)</small>
+        </div>
+
+        <!-- Dynamické parametry pro Crop -->
+        <div id="cropParams" class="param-box">
+            <span class="label">Kolik pixelů uříznout z okrajů:</span>
+            <div class="grid-params">
+                <div><label>Shora (Top):</label> <input type="number" id="cropTop" value="20" min="0"></div>
+                <div><label>Zdola (Bottom):</label> <input type="number" id="cropBottom" value="20" min="0"></div>
+                <div><label>Zleva (Left):</label> <input type="number" id="cropLeft" value="20" min="0"></div>
+                <div><label>Zprava (Right):</label> <input type="number" id="cropRight" value="20" min="0"></div>
+            </div>
+        </div>
+
+        <div style="margin-top: 25px;">
+            <button id="processBtn">Spustit v cloudu</button>
+        </div>
+
+        <div class="status" id="statusText">Status: Připraveno.</div>
+    </div>
+
+    <div class="images">
+        <div>
+            <h3>Originál</h3>
+            <img id="originalImg" alt="Původní obrázek">
+        </div>
+        <div>
+            <h3>Výsledek</h3>
+            <img id="processedImg" alt="Zpracovaný obrázek">
+        </div>
+    </div>
+
+    <script>
+        const API_URL = 'http://localhost:8000';
+        const WS_URL = 'ws://localhost:8000/broker/image.done';
+        const USER_ID = 'cloud_user_123';
+        const BUCKET_ID = 1;
+
+        const fileInput = document.getElementById('fileInput');
+        const operationSelect = document.getElementById('operation');
+        const processBtn = document.getElementById('processBtn');
+        const statusText = document.getElementById('statusText');
+        const originalImg = document.getElementById('originalImg');
+        const processedImg = document.getElementById('processedImg');
+
+        // Přepínání viditelnosti políček
+        operationSelect.addEventListener('change', () => {
+            const op = operationSelect.value;
+            document.getElementById('brightnessParams').style.display = (op === 'brightness') ? 'block' : 'none';
+            document.getElementById('cropParams').style.display = (op === 'crop') ? 'block' : 'none';
+        });
+
+        // WebSocket s podporou Blobu
+        const ws = new WebSocket(WS_URL);
+        ws.onopen = () => ws.send(new Blob([JSON.stringify({ action: "subscribe" })]));
+
+        ws.onmessage = async (event) => {
+            try {
+                const textData = event.data instanceof Blob ? await event.data.text() : event.data;
+                const data = JSON.parse(textData);
+                let payload = data.payload || data;
+                if (payload.payload) payload = payload.payload;
+
+                if (payload.status === 'success' && payload.new_image_id) {
+                    statusText.innerText = 'Status: Hotovo! Stahuji výsledek...';
+                    await fetchAndDisplayImage(payload.new_image_id, processedImg);
+                    statusText.innerText = `Status: Úspěšně dokončeno!`;
+                    if (data.message_id) ws.send(new Blob([JSON.stringify({ action: "ack", message_id: data.message_id })]));
+                } else if (payload.status === 'error') {
+                    statusText.innerText = `Status: Worker nahlásil chybu: ${payload.error}`;
+                    if (data.message_id) ws.send(new Blob([JSON.stringify({ action: "ack", message_id: data.message_id })]));
+                }
+            } catch (err) { console.error("WS parse error:", err); }
+        };
+
+        async function fetchAndDisplayImage(imageId, imgElement) {
+            try {
+                const response = await fetch(`${API_URL}/files/${imageId}`, { headers: { 'x-user-id': USER_ID } });
+                const blob = await response.blob();
+                imgElement.src = URL.createObjectURL(blob);
+                imgElement.style.display = 'block';
+            } catch (error) { statusText.innerText = 'Status: Chyba stahování.'; }
+        }
+
+        processBtn.addEventListener('click', async () => {
+            if (!fileInput.files.length) return alert('Vyberte soubor!');
+
+            const file = fileInput.files[0];
+            const operation = operationSelect.value;
+            
+            // Konstrukce parametrů
+            let params = {};
+            if (operation === 'brightness') {
+                params = { value: parseInt(document.getElementById('brightVal').value) || 0 };
+            } else if (operation === 'crop') {
+                params = {
+                    top: Math.max(0, parseInt(document.getElementById('cropTop').value) || 0),
+                    bottom: Math.max(0, parseInt(document.getElementById('cropBottom').value) || 0),
+                    left: Math.max(0, parseInt(document.getElementById('cropLeft').value) || 0),
+                    right: Math.max(0, parseInt(document.getElementById('cropRight').value) || 0)
+                };
+            }
+
+            try {
+                processBtn.disabled = true;
+                processedImg.style.display = 'none';
+                statusText.innerText = 'Status: Nahrávám na server...';
+
+                // 1. Upload
+                const formData = new FormData();
+                formData.append('file', file);
+                formData.append('bucket_id', BUCKET_ID);
+
+                const upResp = await fetch(`${API_URL}/files/upload`, {
+                    method: 'POST',
+                    headers: { 'x-user-id': USER_ID },
+                    body: formData
+                });
+                const upData = await upResp.json();
+                if (!upResp.ok) throw new Error(upData.detail || 'Upload selhal');
+
+                await fetchAndDisplayImage(upData.id, originalImg);
+
+                // 2. Odeslání požadavku na zpracování
+                statusText.innerText = 'Status: Odesláno do fronty. Čekám na zpracování...';
+                await fetch(`${API_URL}/buckets/${BUCKET_ID}/objects/${upData.id}/process`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'x-user-id': USER_ID },
+                    body: JSON.stringify({ operation, params })
+                });
+
+            } catch (err) {
+                statusText.innerText = `Status: Chyba - ${err.message}`;
+            } finally {
+                processBtn.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>
