@@ -9,3 +9,7 @@ python -m http.server 3000
 
 Otevři prohlížeč: Běž na adresu:
 http://localhost:3000/index.html
+
+
+-- pro testy pouzij: pytest tests_worker.py
+pozn. je tam natvrdo dane id souboru tak je mozna potreba si ho zmenit nebo tam dat to co je za tim zakomentovane
