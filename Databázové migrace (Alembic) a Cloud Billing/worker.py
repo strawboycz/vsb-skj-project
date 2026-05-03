@@ -189,7 +189,8 @@ async def worker_loop():
                             
                         await done_ws.send(json.dumps(result_msg).encode("utf-8"))
                         print(f"[<] Odeslán status do image.done")
-
+                        
+                        await asyncio.sleep(0.25)
                     # --- 5. POTVRZENÍ BROKEROVI (ACK) ---
                     if message_id:
                         ack_msg = {
