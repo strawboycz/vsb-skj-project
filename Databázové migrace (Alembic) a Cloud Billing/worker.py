@@ -4,20 +4,19 @@ import json
 import numpy as np
 from PIL import Image
 import io
-import os
 import traceback
 import httpx
 
 # ==========================================
 # 1. SYNCHRONNÍ NUMPY LOGIKA (Běží ve vlákně)
 # ==========================================
-def process_image_sync(input_path: str, output_path: str, job_data: dict):
+def process_image_sync(image_data, job_data: dict):
     """
     Tato funkce je CPU-bound. Nesmí obsahovat 'await'.
     Načte obrázek, provede maticovou magii a uloží ho.
     """
-    # 1. Načtení obrázku do NumPy
-    img = Image.open(input_path).convert("RGB") # Pojistka, že máme 3 kanály
+    # OPRAVA: Používáme image_data, nikoliv input_path!
+    img = Image.open(image_data).convert("RGB") 
     img_array = np.array(img)
     
     op = job_data.get("operation")
@@ -31,23 +30,34 @@ def process_image_sync(input_path: str, output_path: str, job_data: dict):
         new_array = img_array[:, ::-1, :]
         
     elif op == "crop":
-        # Parametry nyní chápeme jako OKRAJE (kolik uříznout z každé strany)
         params = job_data.get("params", {})
         h, w, _ = img_array.shape
         
-        # Kolik pixelů uříznout z dané strany (výchozí 0)
-        m_top = params.get("top", 0)
-        m_bottom = params.get("bottom", 0)
-        m_left = params.get("left", 0)
-        m_right = params.get("right", 0)
+        # Bezpečné přetypování na integer (kdyby web poslal stringy)
+        try:
+            m_top = int(params.get("top", 0))
+            m_bottom = int(params.get("bottom", 0))
+            m_left = int(params.get("left", 0))
+            m_right = int(params.get("right", 0))
+            
+            # TADY JE TEN KONTROLNÍ TISK
+            print(f"[DEBUG] Crop hodnoty přijaté workerem: Top={m_top}, Bottom={m_bottom}, Left={m_left}, Right={m_right}")
+            
+        except (ValueError, TypeError):
+            raise ValueError("Ořezové parametry musí být platná celá čísla.")
         
         # Výpočet cílových souřadnic (slicing)
         y_start = m_top
         y_end = h - m_bottom
         x_start = m_left
         x_end = w - m_right
-        
-        # Validace: Nesmíme uříznout víc, než obrázek má
+
+        # Validace: Nesmíme uříznout víc, než obrázek má, ani jít do záporných hranic
+        if m_top < 0 or m_bottom < 0 or m_left < 0 or m_right < 0:
+             raise ValueError("Ořezové parametry nemohou být záporné.")
+        if m_top + m_bottom >= h or m_left + m_right >= w:
+             raise ValueError(f"Neplatný ořez. Obrázek {w}x{h} je příliš malý na ořezání o {m_left}+{m_right} a {m_top}+{m_bottom}.")
+             
         if y_start >= y_end or x_start >= x_end:
             raise ValueError(f"Neplatný ořez. Obrázek {w}x{h} nelze oříznout o {m_left}+{m_right} šířky a {m_top}+{m_bottom} výšky.")
             
@@ -55,7 +65,10 @@ def process_image_sync(input_path: str, output_path: str, job_data: dict):
         
     elif op == "brightness":
         # 4. Zesvětlení (Přetypování a Saturace)
-        val = job_data.get("params", {}).get("value", 50)
+        try:
+            val = int(job_data.get("params", {}).get("value", 50))
+        except (ValueError, TypeError):
+            raise ValueError("Hodnota jasu musí být celé číslo.")
         
         # Musíme převést na int16, jinak 250 + 50 přeteče na 44!
         temp_array = img_array.astype(np.int16)
@@ -66,32 +79,27 @@ def process_image_sync(input_path: str, output_path: str, job_data: dict):
         
     elif op == "grayscale":
         # 5. Černobílý filtr (Vážený průměr přes RGB kanály)
-        # R = [:,:,0], G = [:,:,1], B = [:,:,2]
         r = img_array[:, :, 0]
         g = img_array[:, :, 1]
         b = img_array[:, :, 2]
         
         gray_2d = 0.299 * r + 0.587 * g + 0.114 * b
         new_array = gray_2d.astype(np.uint8)
-        # Výsledkem je 2D matice, Pillow ji umí uložit jako "L" mód (grayscale)
         
     else:
         raise ValueError(f"Neznámá operace: {op}")
 
-    # 3. Převod zpět a uložení
+    # 3. Převod zpět a uložení do paměti (bez disku)
     new_img = Image.fromarray(new_array)
-    new_img.save(output_path)
-    return True
+    output_buffer = io.BytesIO()
+    new_img.save(output_buffer, format="JPEG") 
+    output_buffer.seek(0) 
+    return output_buffer
 
 
 # ==========================================
 # 2. ASYNCHRONNÍ WORKER SMYČKA (Event-Driven)
 # ==========================================
-
-TEMP_DIR = "worker_temp"
-os.makedirs(TEMP_DIR, exist_ok=True)
-
-
 async def worker_loop():
     broker_url = "ws://localhost:8000/broker/image.jobs"
     api_base_url = "http://localhost:8000"
@@ -122,47 +130,38 @@ async def worker_loop():
                         print("[-] Chybí potřebné parametry (image_id, user_id, bucket_id), přeskakuji.")
                         continue
                         
-                    input_path = os.path.join(TEMP_DIR, f"in_{image_id}")
-                    output_path = os.path.join(TEMP_DIR, f"out_{image_id}.jpg")
-                    
                     print(f"[>] Zpracovávám: {operation} na {image_id} (User: {user_id})...")
                     
                     status = "success"
                     error_msg = ""
                     new_file_id = None
                     
-                    # Společné hlavičky pro interní komunikaci
                     headers = {
                         "x-user-id": user_id,
-                        "x-internal-source": "true" # Flag pro interní billing
+                        "x-internal-source": "true" 
                     }
                     
                     try:
                         async with httpx.AsyncClient() as client:
-                            # --- 1. STÁHNUTÍ OBRÁZKU DO PAMĚTI (GET) ---
+                            # --- 1. STÁHNUTÍ OBRÁZKU DO PAMĚTI ---
                             dl_resp = await client.get(f"{api_base_url}/files/{image_id}", headers=headers)
                             if dl_resp.status_code != 200:
                                 raise Exception(f"Chyba stahování: {dl_resp.status_code} - {dl_resp.text}")
                             
-                            # OPRAVA: Přečteme obrázek přímo z paměti pomocí io.BytesIO
                             img_data = io.BytesIO(dl_resp.content)
                             
-                            # --- 2. ZPRACOVÁNÍ V NUMPY (Thread) ---
-                            # Funkce process_image_sync si s io.BytesIO poradí místo cesty k souboru!
-                            await asyncio.to_thread(process_image_sync, img_data, output_path, job_data)
+                            # --- 2. ZPRACOVÁNÍ V NUMPY ---
+                            result_buffer = await asyncio.to_thread(process_image_sync, img_data, job_data)
                             
-                            # --- 3. UPLOAD NOVÉHO OBRÁZKU (POST) ---
-                            with open(output_path, "rb") as f:
-                                # Tady už musíme simulovat jméno s koncovkou pro nahrávání přes API
-                                files = {"file": (f"{operation}_{image_id}.jpg", f, "image/jpeg")}
-                                data = {"bucket_id": bucket_id}
-                                up_resp = await client.post(f"{api_base_url}/files/upload", headers=headers, data=data, files=files)
+                            # --- 3. UPLOAD Z PAMĚTI ---
+                            files = {"file": (f"{operation}_{image_id}.jpg", result_buffer, "image/jpeg")}
+                            data = {"bucket_id": str(bucket_id)} # Pro jistotu převedeno na string pro Form data
+                            up_resp = await client.post(f"{api_base_url}/files/upload", headers=headers, data=data, files=files)
                                 
-                                if up_resp.status_code != 200:
-                                    raise Exception(f"Chyba nahrávání: {up_resp.status_code} - {up_resp.text}")
+                            if up_resp.status_code != 200:
+                                raise Exception(f"Chyba nahrávání: {up_resp.status_code} - {up_resp.text}")
                                 
-                                new_file_id = up_resp.json().get("id")
-
+                            new_file_id = up_resp.json().get("id")
                             print(f"[+] Úspěšně zpracováno a nahráno zpět jako: {new_file_id}")
                             
                     except ValueError as ve:
@@ -173,10 +172,6 @@ async def worker_loop():
                         status = "error"
                         error_msg = str(e)
                         print(f"[!] {error_msg}")
-                        
-                    # Úklid dočasných souborů, abychom nezaplnili disk
-                    if os.path.exists(input_path): os.remove(input_path)
-                    if os.path.exists(output_path): os.remove(output_path)
                         
                     # --- 4. ODESLÁNÍ VÝSLEDKU DO TÉMATU image.done ---
                     async with websockets.connect("ws://localhost:8000/broker/image.done") as done_ws:
@@ -203,7 +198,6 @@ async def worker_loop():
                         }
                         await websocket.send(json.dumps(ack_msg).encode("utf-8"))
                         print(f"[<] Odesláno ACK pro message_id: {message_id}")
-
 
         except websockets.exceptions.ConnectionClosed:
             print("[!] Spojení s brokerem ztraceno. Zkouším se znovu připojit za 3s...")
