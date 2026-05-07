@@ -145,7 +145,7 @@ async def worker_loop():
                         async with httpx.AsyncClient() as client:
                             # --- 1. STÁHNUTÍ OBRÁZKU DO PAMĚTI ---
                             dl_resp = await client.get(f"{api_base_url}/files/{image_id}", headers=headers)
-                            if dl_resp.status_code != 200:
+                            if dl_resp.status_code not in [200, 201, 202]:
                                 raise Exception(f"Chyba stahování: {dl_resp.status_code} - {dl_resp.text}")
                             
                             img_data = io.BytesIO(dl_resp.content)
@@ -158,10 +158,15 @@ async def worker_loop():
                             data = {"bucket_id": str(bucket_id)} # Pro jistotu převedeno na string pro Form data
                             up_resp = await client.post(f"{api_base_url}/files/upload", headers=headers, data=data, files=files)
                                 
-                            if up_resp.status_code != 200:
+                            # OPRAVENO: Přidán kód 202 mezi povolené (úspěšné) stavy
+                            if up_resp.status_code not in [200, 201, 202]:
                                 raise Exception(f"Chyba nahrávání: {up_resp.status_code} - {up_resp.text}")
                                 
-                            new_file_id = up_resp.json().get("id")
+                            # FastAPI nám při statusu 202 vrací {"detail": "...", "object_id": "uuid..."} nebo objekt
+                            # Musíme se ujistit, že vytáhneme správné ID (id nebo object_id podle toho, co vrací main.py)
+                            up_data = up_resp.json()
+                            new_file_id = up_data.get("id") or up_data.get("object_id")
+                            
                             print(f"[+] Úspěšně zpracováno a nahráno zpět jako: {new_file_id}")
                             
                     except ValueError as ve:
