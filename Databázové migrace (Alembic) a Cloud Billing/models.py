@@ -29,19 +29,23 @@ class FileMetadata(Base):
     __tablename__ = 'files'
     id: Mapped[str] = mapped_column(String(50), primary_key=True)
     filename: Mapped[str] = mapped_column(String(100), nullable=False)
-    path: Mapped[str] = mapped_column(String(255), nullable=False)
     size: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[str] = mapped_column(String(50), nullable=False)
     
-    # Úkol 3: Soft Delete
-    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+    # NOVÉ POLE: Stavový automat
+    # "uploading" -> "ready" -> "deleted"
+    status: Mapped[str] = mapped_column(String(20), default="uploading")
     
+    # NOVÉ POLE: Souřadnice v Haystacku
+    volume_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    offset: Mapped[int] = mapped_column(Integer, nullable=True)
+    
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
     user_id: Mapped[str] = mapped_column(ForeignKey('users.id'))
     bucket_id: Mapped[int] = mapped_column(ForeignKey('buckets.id'), nullable=True)
     
     owner: Mapped["User"] = relationship(back_populates='files')
     bucket: Mapped["Bucket"] = relationship(back_populates='objects')
-
 """
 Garantované doručení a perzistence (Durable Queues)
 """

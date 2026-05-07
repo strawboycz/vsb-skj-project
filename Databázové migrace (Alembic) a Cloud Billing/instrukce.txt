@@ -1,0 +1,10 @@
+uvicorn main:app --reload
+
+python haystack_node.py
+
+
+python worker.py
+
+python -m http.server 3000
+
+python3 compact.py
