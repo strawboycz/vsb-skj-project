@@ -1,10 +1,35 @@
-uvicorn main:app --reload
+NÁVOD K OBSLUZE SYSTÉMU HAYSTACK CLOUD PROCESSOR
+==============================================
 
-python haystack_node.py
+Pro správný chod je nutné mít otevřeno 5 samostatných terminálů.
 
+1. HLAVNÍ API A BROKER (S3 Gateway)
+   Příkaz: uvicorn main:app --reload
+   Proč:  Mozek celého systému. Přijímá HTTP požadavky od uživatele, spravuje 
+          databázi metadat a distribuuje práci Workerům přes WebSocket Broker.
 
-python worker.py
+2. BINÁRNÍ ÚLOŽIŠTĚ (Haystack Node)
+   Příkaz: python haystack_node.py
+   Proč:  Svaly systému. Tato služba fyzicky zapisuje binární data do velkých 
+          svazků (volume_1.dat) a čte je na základě offsetů. Běží na portu 8001.
 
-python -m http.server 3000
+3. OBRAZOVÝ PROCESOR (Image Worker)
+   Příkaz: python worker.py
+   Proč:  Provádí náročné výpočty (negativ, filtry, ořez) pomocí knihovny NumPy. 
+          Naslouchá na frontě úloh a výsledek nahrává zpět do systému.
 
-python3 compact.py
+4. WEBOVÉ ROZHRANÍ (Frontend)
+   Příkaz: python -m http.server 3000
+   Proč:  Spustí jednoduchý webový server, abyste mohli nahrávat fotky 
+          a vidět výsledky v prohlížeči na adrese http://localhost:3000.
+
+5. ÚDRŽBA A ČIŠTĚNÍ (Kompaktor)
+   Příkaz: python3 compact.py
+   Proč:  Spouští se jednorázově, když chcete uvolnit místo. Projde binární 
+          soubory, vymaže "díry" po smazaných fotkách a přeskládá ty platné 
+          těsně za sebe.
+
+POZNÁMKY:
+- Všechny služby (1, 2, 3) musí běžet současně, aby nahrávání fungovalo.
+- Pokud Worker nahlásí chybu 202, ujistěte se, že máte v worker.py 
+  opravenou validaci status kódů.
