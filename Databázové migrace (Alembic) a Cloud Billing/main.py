@@ -1,13 +1,18 @@
 import os
 import uuid
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Depends, Form, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Depends, Form, WebSocket, WebSocketDisconnect, Response, status
 from fastapi.responses import FileResponse as FastAPIFileResponse
+from fastapi.responses import StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 import json
 import msgpack
 import aiofiles
 import ConnectionManager
+import asyncio
+import websockets
+import httpx
+
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -17,6 +22,9 @@ import models
 import schemas
 
 from fastapi.middleware.cors import CORSMiddleware
+
+models.Base.metadata.create_all(bind=engine)
+
 
 app = FastAPI(title="Mini Cloud Storage")
 
@@ -97,12 +105,12 @@ async def get_bucket_billing(bucket_id: int, db: Session = Depends(get_db)):
 # ==========================================
 
 # 1. Upload
-@app.post("/files/upload", response_model=schemas.FileResponse)
+# 1. Upload
+@app.post("/files/upload", status_code=status.HTTP_202_ACCEPTED) # Změněno na 202!
 async def upload_file(
     file: UploadFile = File(...), 
     x_user_id: str = Header(...),
     bucket_id: int = Form(...),
-    x_internal_source: bool = Header(False, description="True pro interní provoz"),
     db: Session = Depends(get_db)
 ):
     stmt_user = select(models.User).where(models.User.id == x_user_id)
@@ -120,42 +128,49 @@ async def upload_file(
         raise HTTPException(status_code=404, detail="Zadaný bucket neexistuje")
 
     file_id = str(uuid.uuid4())
-    user_dir = os.path.join(STORAGE_DIR, x_user_id)
-    os.makedirs(user_dir, exist_ok=True)
-    file_path = os.path.join(user_dir, file_id)
-    
-    file_size = 0
-    async with aiofiles.open(file_path, 'wb') as out_file:
-        content = await file.read()
-        await out_file.write(content)
-        file_size = len(content)
+    content = await file.read()
+    file_size = len(content)
         
     db_file = models.FileMetadata(
         id=file_id,
         filename=file.filename,
-        path=file_path,
+        # path už zde nepoužíváme! Nahrazeno volume_id a offsetem v Haystacku
         size=file_size,
         created_at=datetime.utcnow().isoformat(),
         user_id=x_user_id,
         bucket_id=bucket.id,
-        is_deleted=False
+        is_deleted=False,
+        status="uploading" # NOVÉ: Stavový automat
     )
-    
-    # ADVANCED BILLING: Rozlišení původu dat a přidání do storage
-    bucket.current_storage_bytes += file_size
-    if x_internal_source:
-        bucket.internal_transfer_bytes += file_size
-    else:
-        bucket.ingress_bytes += file_size
-    
     db.add(db_file)
     db.commit()
+    # ... (tady je db.add a db.commit)
     db.refresh(db_file)
+    
+    # Odešleme do Haystack uzlu přes broker
+    storage_payload = {
+        "object_id": file_id,
+        "image_data": content   
+    }
+    
+    # 1. Uložíme do databáze jako zálohu (pro případ výpadku)
+    msg_id = str(uuid.uuid4())
+    raw_payload = msgpack.packb({"action": "publish", "payload": storage_payload})
+    new_msg = models.QueuedMessage(id=msg_id, topic="storage.write", payload=raw_payload)
+    await run_in_threadpool(save_msg_to_db, new_msg)
+    
+    # 2. OPRAVA: Pošleme Haystacku zprávu s akcí "deliver", na kterou už uslyší!
+    deliver_msg = {
+        "action": "deliver",
+        "message_id": msg_id,
+        "payload": storage_payload
+    }
+    await manager.broadcast(msgpack.packb(deliver_msg), "storage.write")
     
     return db_file
 
 
-# 2. Stažení
+# 2. Stažení (Upraveno pro stabilní proxy z Haystacku)
 @app.get("/files/{id}")
 async def download_file(
     id: str, 
@@ -163,7 +178,7 @@ async def download_file(
     x_internal_source: bool = Header(False, description="True pro interní provoz"),
     db: Session = Depends(get_db)
 ):
-    # SOFT DELETE FILTR: Nedovolí stáhnout smazaný soubor
+    # SOFT DELETE FILTR
     stmt = select(models.FileMetadata).where(
         models.FileMetadata.id == id,
         models.FileMetadata.is_deleted == False
@@ -176,10 +191,10 @@ async def download_file(
     if db_file.user_id != x_user_id:
         raise HTTPException(status_code=403, detail="Nemáte přístup k tomuto souboru")
         
-    if not os.path.exists(db_file.path):
-        raise HTTPException(status_code=404, detail="Fyzický soubor nenalezen na disku")
+    if getattr(db_file, "status", None) != "ready":
+        raise HTTPException(status_code=400, detail="Soubor se ještě nahrává, zkuste to za chvíli")
         
-    # ADVANCED BILLING: Stahování je Egress nebo Interní přenos
+    # ADVANCED BILLING
     if db_file.bucket_id:
         stmt_bucket = select(models.Bucket).where(models.Bucket.id == db_file.bucket_id)
         bucket = db.execute(stmt_bucket).scalar_one_or_none()
@@ -189,8 +204,26 @@ async def download_file(
             else:
                 bucket.egress_bytes += db_file.size
             db.commit()
+
+    # HAYSTACK PROXY: Přímé stažení do paměti (mnohem stabilnější než streamování)
+    haystack_url = f"http://localhost:8001/volume/{db_file.volume_id}/{db_file.offset}/{db_file.size}"
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            # Stáhne celý obrázek z Haystacku
+            response = await client.get(haystack_url)
             
-    return FastAPIFileResponse(path=db_file.path, filename=db_file.filename)
+            if response.status_code != 200:
+                raise HTTPException(status_code=500, detail=f"Haystack uzel vrátil chybu {response.status_code}")
+                
+            # Odešle obrázek klientovi (Workeru / Webu)
+            return Response(
+                content=response.content, 
+                media_type="image/jpeg", 
+                headers={"Content-Disposition": f"inline; filename={db_file.filename}"}
+            )
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=500, detail=f"Chyba spojení s Haystack uzlem: {str(e)}")
 
 
 # 3. Smazání
@@ -239,6 +272,58 @@ async def list_files(x_user_id: str = Header(...), db: Session = Depends(get_db)
     
     return {"files": user_files}
 
+# 5. Výpis jedne
+@app.get("/files/{id}")
+async def download_file(
+    id: str, 
+    x_user_id: str = Header(...), 
+    x_internal_source: bool = Header(False, description="True pro interní provoz"),
+    db: Session = Depends(get_db)
+):
+    # SOFT DELETE FILTR
+    stmt = select(models.FileMetadata).where(
+        models.FileMetadata.id == id,
+        models.FileMetadata.is_deleted == False
+    )
+    db_file = db.execute(stmt).scalar_one_or_none()
+    
+    if not db_file:
+        raise HTTPException(status_code=404, detail="Soubor nenalezen nebo byl přesunut do koše")
+    
+    if db_file.user_id != x_user_id:
+        raise HTTPException(status_code=403, detail="Nemáte přístup k tomuto souboru")
+        
+    if getattr(db_file, "status", None) != "ready":
+        raise HTTPException(status_code=400, detail="Soubor se ještě nahrává, zkuste to za chvíli")
+        
+    # ADVANCED BILLING
+    if db_file.bucket_id:
+        stmt_bucket = select(models.Bucket).where(models.Bucket.id == db_file.bucket_id)
+        bucket = db.execute(stmt_bucket).scalar_one_or_none()
+        if bucket:
+            if x_internal_source:
+                bucket.internal_transfer_bytes += db_file.size
+            else:
+                bucket.egress_bytes += db_file.size
+            db.commit()
+
+    # ZDE JE KOUZLO HAYSTACKU: Pošleme HTTP požadavek na náš druhý mikroslužbový uzel
+    haystack_url = f"http://localhost:8001/volume/{db_file.volume_id}/{db_file.offset}/{db_file.size}"
+    
+    async def stream_from_haystack():
+        async with httpx.AsyncClient() as client:
+            async with client.stream("GET", haystack_url) as response:
+                if response.status_code != 200:
+                    raise HTTPException(status_code=500, detail="Chyba čtení z Haystack uzlu")
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+
+    return StreamingResponse(
+        stream_from_haystack(), 
+        media_type="image/jpeg", 
+        headers={"Content-Disposition": f"inline; filename={db_file.filename}"}
+    )
+
 
 
 # ukol 5 -> pomocne funkce pro databazi
@@ -268,6 +353,66 @@ def get_undelivered_from_db(topic: str):
         # Magie: Odpojíme zprávy od DB, aby nezařvaly chybu po zavření bloku 'with'
         db.expunge_all() 
         return msgs
+    
+# ==========================================
+# HAYSTACK ACK LISTENER
+# ==========================================
+def update_file_metadata_in_db(object_id: str, volume_id: int, offset: int, size: int):
+    with Session(engine) as db:
+        stmt = select(models.FileMetadata).where(models.FileMetadata.id == object_id)
+        db_file = db.execute(stmt).scalar_one_or_none()
+        
+        if db_file and getattr(db_file, "status", None) == "uploading":
+            db_file.volume_id = volume_id
+            db_file.offset = offset
+            db_file.status = "ready"
+            
+            # ADVANCED BILLING: Účtujeme až ve chvíli, kdy je soubor reálně na disku!
+            if db_file.bucket_id:
+                stmt_bucket = select(models.Bucket).where(models.Bucket.id == db_file.bucket_id)
+                bucket = db.execute(stmt_bucket).scalar_one_or_none()
+                if bucket:
+                    bucket.ingress_bytes += size
+            
+            db.commit()
+            print(f"[*] Soubor {object_id} je READY ve volume {volume_id}")
+
+async def listen_for_storage_acks():
+    """Naslouchá na storage.ack a potvrzuje uložení do Haystacku."""
+    uri = "ws://localhost:8000/broker/storage.ack"
+    
+    while True:
+        try:
+            async with websockets.connect(uri, ping_interval=None) as websocket:
+                while True:
+                    message = await websocket.recv()
+                    
+                    try:
+                        data = json.loads(message)
+                    except:
+                        data = msgpack.unpackb(message)
+
+                    if data.get("action") == "deliver":
+                        payload = data.get("payload", {})
+                        if "object_id" in payload:
+                            await run_in_threadpool(
+                                update_file_metadata_in_db,
+                                object_id=payload["object_id"],
+                                volume_id=payload["volume_id"],
+                                offset=payload["offset"],
+                                size=payload["size"]
+                            )
+                            # Odeslání ACK brokeru, že Gateway zprávu zpracovala
+                            ack = {"action": "ack", "message_id": data.get("message_id")}
+                            await websocket.send(json.dumps(ack).encode("utf-8"))
+
+        except Exception as e:
+            await asyncio.sleep(3)
+
+@app.on_event("startup")
+async def startup_event():
+    # Spustí naslouchání na pozadí hned po startu API
+    asyncio.create_task(listen_for_storage_acks())
 
 
 @app.websocket("/broker/{topic}")
@@ -426,3 +571,34 @@ async def process_image(
     await manager.broadcast(deliver_bytes, topic)
 
     return {"status": "processing_started"}
+
+# ==========================================
+# ADMIN ENDPOINTY PRO KOMPAKCI (ÚKOL 4)
+# ==========================================
+@app.get("/admin/volume/{volume_id}/files", response_model=schemas.CompactFileListResponse)
+async def get_volume_files_for_compaction(volume_id: int, db: Session = Depends(get_db)):
+    """Vrátí seznam všech nesmazaných souborů v daném svazku pro kompaktor."""
+    # Kritické: Řazení podle offsetu, aby kompaktor četl disk postupně
+    stmt = select(models.FileMetadata).where(
+        models.FileMetadata.volume_id == volume_id,
+        models.FileMetadata.is_deleted == False,
+        models.FileMetadata.status == "ready"
+    ).order_by(models.FileMetadata.offset.asc())
+    
+    valid_files = db.execute(stmt).scalars().all()
+    return {"files": valid_files}
+
+@app.patch("/admin/files/{file_id}/relocate")
+async def relocate_file(file_id: str, request: schemas.RelocateFileRequest, db: Session = Depends(get_db)):
+    """Aktualizuje pozici souboru v databázi po jeho přesunutí kompaktorem."""
+    stmt = select(models.FileMetadata).where(models.FileMetadata.id == file_id)
+    db_file = db.execute(stmt).scalar_one_or_none()
+    
+    if not db_file:
+        raise HTTPException(status_code=404, detail="Soubor nenalezen")
+        
+    db_file.volume_id = request.new_volume_id
+    db_file.offset = request.new_offset
+    db.commit()
+    
+    return {"detail": f"Soubor {file_id} přesunut do volume {request.new_volume_id} na offset {request.new_offset}"}
