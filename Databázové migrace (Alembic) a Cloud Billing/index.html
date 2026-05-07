@@ -140,12 +140,35 @@
         };
 
         async function fetchAndDisplayImage(imageId, imgElement) {
-            try {
-                const response = await fetch(`${API_URL}/files/${imageId}`, { headers: { 'x-user-id': USER_ID } });
-                const blob = await response.blob();
-                imgElement.src = URL.createObjectURL(blob);
-                imgElement.style.display = 'block';
-            } catch (error) { statusText.innerText = 'Status: Chyba stahování.'; }
+            let attempts = 0;
+            const maxAttempts = 10; // Zkusíme to 10x (max 5 vteřin čekání)
+
+            while (attempts < maxAttempts) {
+                try {
+                    const response = await fetch(`${API_URL}/files/${imageId}`, { headers: { 'x-user-id': USER_ID } });
+                    
+                    if (response.status === 400) {
+                        // Backend říká "Ještě se nahrává". Počkáme 500ms a zkusíme znovu.
+                        console.log("Závodní podmínka: Soubor ještě není v Haystacku, čekám 500ms...");
+                        await new Promise(resolve => setTimeout(resolve, 500));
+                        attempts++;
+                        continue;
+                    }
+
+                    if (!response.ok) throw new Error(`Chyba stahování: ${response.status}`);
+
+                    // Úspěch! Haystack uložil a Gateway posílá data.
+                    const blob = await response.blob();
+                    imgElement.src = URL.createObjectURL(blob);
+                    imgElement.style.display = 'block';
+                    return; // Ukončíme smyčku
+
+                } catch (error) { 
+                    statusText.innerText = 'Status: Chyba stahování originálu.';
+                    throw error; // Propíšeme chybu výš, aby se nezavolal /process
+                }
+            }
+            throw new Error("Vypršel časový limit pro uložení do Haystacku.");
         }
 
         processBtn.addEventListener('click', async () => {
