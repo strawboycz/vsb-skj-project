@@ -66,3 +66,19 @@ class BrightnessParams(BaseModel):
 class ProcessImageRequest(BaseModel):
     operation: str = Field(..., description="Typ operace (negative, flip, crop, brightness, grayscale)")
     params: Optional[Dict[str, Any]] = None
+
+# ==========================================
+# MODELY PRO KOMPAKCI (ADMIN - ÚKOL 4)
+# ==========================================
+class CompactFileItem(BaseModel):
+    id: str
+    offset: int
+    size: int
+    model_config = ConfigDict(from_attributes=True)
+
+class CompactFileListResponse(BaseModel):
+    files: List[CompactFileItem]
+
+class RelocateFileRequest(BaseModel):
+    new_volume_id: int
+    new_offset: int
