@@ -3,6 +3,9 @@ import asyncio
 import websockets
 import msgpack
 import json
+import glob
+import re
+import aiofiles
 from fastapi import FastAPI, HTTPException, Response
 
 # ==========================================
@@ -12,8 +15,25 @@ VOLUME_DIR = "volumes"
 MAX_VOLUME_SIZE = 100 * 1024 * 1024  # 100 MB limit
 BROKER_URL = "ws://localhost:8000/broker"
 
+def get_last_volume_id() -> int:
+    """Prohledá složku a najde nejvyšší ID svazku na disku."""
+    volume_files = glob.glob(os.path.join(VOLUME_DIR, "volume_*.dat"))
+    if not volume_files:
+        return 1
+    
+    ids = []
+    for filepath in volume_files:
+        # Extrahuje číslo z názvu "volume_12.dat"
+        match = re.search(r"volume_(\d+)\.dat", os.path.basename(filepath))
+        if match:
+            ids.append(int(match.group(1)))
+            
+    return max(ids) if ids else 1
+
+
 # Globální stav pro aktuální svazek
-current_volume_id = 1
+current_volume_id = get_last_volume_id()
+print(f"[*] Haystack Node startuje se svazkem ID: {current_volume_id}")
 
 app = FastAPI(title="Haystack Storage Node")
 
@@ -23,6 +43,7 @@ os.makedirs(VOLUME_DIR, exist_ok=True)
 # ==========================================
 # POMOCNÉ FUNKCE PRO ROTACI A ZÁPIS
 # ==========================================
+
 def get_active_volume_path() -> str:
     global current_volume_id
     
@@ -70,7 +91,7 @@ async def listen_to_broker():
     while True:
         try:
             print("[*] Haystack Node se připojuje k brokeru...")
-            async with websockets.connect(uri, ping_interval=None) as websocket:
+            async with websockets.connect(uri, ping_interval=None, max_size=None) as websocket:
                 print("[*] Haystack Node úspěšně připojen! Čekám na fotky k zápisu.")
                 
                 while True:
@@ -98,14 +119,13 @@ async def listen_to_broker():
                             active_file = get_active_volume_path()
                             vol_id = current_volume_id
                             
-                            # Přejmenováno z 'f' na 'file_obj' pro absolutní jistotu
-                            with open(active_file, "ab+") as file_obj:
-                                offset = file_obj.tell()
-                                file_obj.write(image_data)
+                            async with aiofiles.open(active_file, "ab+") as file_obj:
+                                offset = await file_obj.tell()      # <- Přidáno await
+                                await file_obj.write(image_data)    # <- Přidáno await
                                 size = len(image_data)
-                                
+    
                             print(f"[+] Uloženo! Vol: {vol_id}, Offset: {offset}, Size: {size}")
-                            
+
                             ack_msg = msgpack.packb({"action": "ack", "message_id": message_id})
                             await websocket.send(ack_msg)
                             
@@ -148,3 +168,8 @@ async def read_image(volume_id: int, offset: int, size: int):
         return Response(content=data, media_type="image/jpeg")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+if __name__ == "__main__":
+    import uvicorn
+    # V instrukcích píšeš, že má běžet na portu 8001
+    uvicorn.run(app, host="127.0.0.1", port=8001)

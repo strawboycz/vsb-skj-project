@@ -33,3 +33,10 @@ POZNÁMKY:
 - Všechny služby (1, 2, 3) musí běžet současně, aby nahrávání fungovalo.
 - Pokud Worker nahlásí chybu 202, ujistěte se, že máte v worker.py 
   opravenou validaci status kódů.
+
+Web:
+http://localhost:3000/
+API:
+http://localhost:8000/docs
+
+cloud_user_123

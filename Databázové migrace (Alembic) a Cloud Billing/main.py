@@ -407,6 +407,7 @@ async def listen_for_storage_acks():
                             await websocket.send(json.dumps(ack).encode("utf-8"))
 
         except Exception as e:
+            print(f"[DEBUG] Kritická chyba v listen_for_storage_acks: {e}")
             await asyncio.sleep(3)
 
 @app.on_event("startup")

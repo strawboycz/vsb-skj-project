@@ -25,7 +25,7 @@ async def test_worker_processes_10_tasks():
                     "payload": {
                         "operation": "negative",
                         # POUŽITO REÁLNÉ ID Z TVOJÍ DATABÁZE
-                        "image_id": "4844d8b7-e651-4ee5-8d64-a2530cf55bbf", 
+                        "image_id": "5a7bdcba-4b66-4c70-bd8d-a26148d44470", 
                         "user_id": "cloud_user_123",
                         "bucket_id": 1
                     }

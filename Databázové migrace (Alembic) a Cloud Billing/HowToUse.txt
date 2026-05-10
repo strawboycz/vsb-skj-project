@@ -11,5 +11,8 @@ Otevři prohlížeč: Běž na adresu:
 http://localhost:3000/index.html
 
 
--- pro testy pouzij: pytest tests_worker.py
+5a7bdcba-4b66-4c70-bd8d-a26148d44470
+cloud_user_123
+
+-- pro testy pouzij: pytest tests_Worker2.py -v -s
 pozn. je tam natvrdo dane id souboru tak je mozna potreba si ho zmenit nebo tam dat to co je za tim zakomentovane
